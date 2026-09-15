@@ -1,0 +1,36 @@
+# Pinned environment for lba-project. Python 3.11 required.
+#
+# torch, torch-scatter and torch-cluster are NOT installable from PyPI alone —
+# they need the extra indexes below. `bash scripts/setup_env.sh` handles this.
+# Installing this file directly with plain `pip install -r` will fail on those
+# three lines; that is expected.
+
+# --- Deep learning (index: https://download.pytorch.org/whl/cu124) ---
+torch==2.5.1+cu124
+torchvision==0.20.1+cu124
+
+# --- Geometric DL (find-links: https://data.pyg.org/whl/torch-2.5.1+cu124.html) ---
+torch-geometric==2.6.1
+torch_scatter==2.1.2+pt25cu124
+torch_cluster==1.6.3+pt25cu124
+
+# --- Structural biology / cheminformatics ---
+atom3d==0.2.6
+rdkit==2025.3.6
+biopython==1.85
+py3Dmol==2.5.2
+
+# --- Scientific stack ---
+numpy==2.4.6
+scipy==1.17.1
+pandas==3.0.5
+scikit-learn==1.9.1
+matplotlib==3.11.2
+seaborn==0.13.2
+
+# --- Tooling ---
+jupyterlab==4.6.3
+ipywidgets==8.1.8
+tensorboard==2.21.0
+tqdm==4.70.1
+PyYAML==6.0.3

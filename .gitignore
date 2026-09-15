@@ -1,0 +1,33 @@
+# Environment
+.venv/
+env/
+*.egg-info/
+__pycache__/
+*.py[cod]
+
+# Data — never commit. See README for how to fetch.
+data/raw/
+data/processed/
+data/splits/
+*.lmdb
+*.mdb
+*.tar.gz
+*.pdb
+*.sdf
+*.mol2
+
+# Results — keep the tracked summary CSVs, ignore bulk artifacts
+results/logs/
+results/checkpoints/
+*.ckpt
+*.pt
+runs/
+wandb/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
