@@ -62,6 +62,24 @@ def main() -> int:
         print(f"extensions      FAILED: {exc}")
         failures.append("torch_scatter/torch_cluster do not run")
 
+    # atom3d rebuilds its serialized DataFrames only when the type tag in the
+    # LMDB matches str(pd.DataFrame). pandas 3.0 changed that string, which
+    # makes every atoms_* field load as a dict with no error raised at all.
+    try:
+        import pandas as pd
+
+        tag = str(pd.DataFrame)
+        if tag != "<class 'pandas.core.frame.DataFrame'>":
+            print(f"\npandas          {pd.__version__} INCOMPATIBLE (tag: {tag})")
+            failures.append(
+                f"pandas {pd.__version__} breaks atom3d DataFrame deserialization "
+                "silently - pin pandas<3.0"
+            )
+        else:
+            print(f"\npandas          {pd.__version__} atom3d tag OK")
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"pandas check failed: {exc}")
+
     if failures:
         print("\nFAILED:")
         for failure in failures:

@@ -23,8 +23,15 @@ py3Dmol==2.5.2
 # --- Scientific stack ---
 numpy==2.4.6
 scipy==1.17.1
-pandas==3.0.5
+# PIN: pandas MUST stay <3.0. atom3d tags serialized DataFrames in its LMDB
+# files with the string "<class 'pandas.core.frame.DataFrame'>" and rebuilds them
+# only if it equals str(pd.DataFrame) (atom3d/datasets/datasets.py:107).
+# pandas 3.0 changed that to "<class 'pandas.DataFrame'>", so the check silently
+# fails and every atoms_* field loads as a raw dict instead of a DataFrame --
+# no error, no warning. scripts/smoke_test_lba.py catches this.
+pandas==2.3.3
 scikit-learn==1.9.1
+pyarrow==25.0.1          # parquet cache for the ligand record tables
 matplotlib==3.11.2
 seaborn==0.13.2
 

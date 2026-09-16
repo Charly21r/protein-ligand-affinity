@@ -31,7 +31,7 @@ $PIP install -q "torch-scatter==2.1.2" "torch-cluster==1.6.3" \
 echo "==> Installing structural biology and scientific stack"
 $PIP install -q \
   "atom3d==0.2.6" "rdkit==2025.3.6" "biopython==1.85" "py3Dmol==2.5.2" \
-  "scikit-learn==1.9.1" "scipy==1.17.1" "pandas==3.0.5" \
+  "scikit-learn==1.9.1" "scipy==1.17.1" "pandas==2.3.3" "pyarrow==25.0.1" \
   "matplotlib==3.11.2" "seaborn==0.13.2" \
   "jupyterlab==4.6.3" "ipywidgets==8.1.8" "tensorboard==2.21.0" \
   "tqdm==4.70.1" "PyYAML==6.0.3"
