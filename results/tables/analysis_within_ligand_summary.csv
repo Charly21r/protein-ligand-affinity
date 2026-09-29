@@ -1,0 +1,2 @@
+n_complexes,n_distinct_ligands,n_repeated_ligands,n_complexes_repeated,median_within_ligand_sd,mean_within_ligand_sd,median_within_ligand_range,max_within_ligand_range,oracle_rmse,overall_label_sd
+4463,3484,453,1432,0.7163041718897546,0.8621564525262639,1.13,6.43,0.9582350674898782,1.9737241555395697

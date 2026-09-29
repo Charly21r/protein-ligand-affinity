@@ -1,0 +1,5 @@
+reference,model,metric,delta,ci_low,ci_high,significant,b_better,n_boot
+ligand_descriptors_full,pocket_composition,pearson_r,-0.03971062448753698,-0.10542702225703805,0.026834644650223508,False,False,3000
+ligand_descriptors_full,pocket_composition,rmse,0.017002615620552275,-0.059294694026496064,0.09162691649919136,False,False,3000
+ligand_descriptors_full,pocket_composition_size,pearson_r,0.08034727601971059,0.009930888472743616,0.15009802488363239,True,True,3000
+ligand_descriptors_full,pocket_composition_size,rmse,-0.10785182998390153,-0.19278520466124655,-0.01995128389651179,True,True,3000
