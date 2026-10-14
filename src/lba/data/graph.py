@@ -33,6 +33,16 @@ because it is baked into the benchmark - but it does keep graphs small enough
 for a 4 GiB card. Treat node count as a feature the model can read, and check
 any score against the ``n_residues`` baseline rather than against
 predict-the-mean.
+
+**The neighbour cap must not bind.** ``torch_cluster.radius_graph`` truncates to
+``max_num_neighbors`` by *atom index order*, not by distance, so a cap that
+actually engages discards arbitrary close contacts and makes the graph depend on
+the order atoms happen to appear in the deposited frame. An initial cap of 32 was
+truncating a node in 77% of training complexes, which the permutation arm of
+``scripts/test_equivariance.py`` caught. Over 300 training complexes the uncapped
+maximum degree at a 5 A cutoff is 42, so the default is 48: above the observed
+ceiling, costing ~9% more edges, and leaving the graph a true radius graph.
+Raising ``edge_cutoff`` means re-measuring this.
 """
 
 from __future__ import annotations
@@ -137,7 +147,7 @@ def build_complex_graph(
     item: dict,
     pocket_cutoff: float = 8.0,
     edge_cutoff: float = 5.0,
-    max_neighbors: int = 32,
+    max_neighbors: int = 48,
     n_rbf: int = 16,
     dtype: torch.dtype = torch.float32,
 ) -> Data:
@@ -156,7 +166,8 @@ def build_complex_graph(
         ``id`` and ``scores``.
     :param pocket_cutoff: keep pocket atoms within this many A of the ligand.
     :param edge_cutoff: connect atoms closer than this many A.
-    :param max_neighbors: cap on edges per node, to bound memory on dense pockets.
+    :param max_neighbors: cap on edges per node. Default 48, which is above the
+        observed maximum and therefore never actually binds - see below.
     :param n_rbf: number of radial basis functions for the distance expansion.
     :param dtype: precision for coordinates and features. float32 for training;
         ``scripts/test_equivariance.py`` passes float64 so that its tight
@@ -263,7 +274,7 @@ def build_split_graphs(
     cache_dir: pathlib.Path | None = DEFAULT_CACHE,
     pocket_cutoff: float = 8.0,
     edge_cutoff: float = 5.0,
-    max_neighbors: int = 32,
+    max_neighbors: int = 48,
     n_rbf: int = 16,
     rebuild: bool = False,
 ) -> list[Data]:
