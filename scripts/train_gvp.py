@@ -4,7 +4,7 @@
 Sanity-check the pipeline first - this must reach near-zero loss in a couple of
 minutes on CPU, and if it does not, nothing below is worth running::
 
-    .venv/bin/python scripts/train_gvp.py --overfit 16 --epochs 120
+    .venv/bin/python scripts/train_gvp.py --overfit 16
 
 Then the real thing, which wants a GPU::
 
@@ -139,8 +139,19 @@ def train_one_seed(
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     # Plateau scheduling on the selection metric, so the schedule and the
     # selection criterion cannot disagree about what "better" means.
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=args.lr_patience
+    #
+    # ``--lr-patience 0`` disables it entirely, which is what the overfit test
+    # uses. That is not a detail: with patience 5 the scheduler fired four times
+    # in the first 32 epochs of a capacity test, dropping the LR to 6e-5 before
+    # the model could converge, and the test failed for a reason that had
+    # nothing to do with the model. Validation r early in training is noisy and
+    # not monotonic, so it is a poor plateau signal until the fit has settled.
+    scheduler = (
+        torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="max", factor=0.5, patience=args.lr_patience
+        )
+        if args.lr_patience > 0
+        else None
     )
     loss_fn = nn.MSELoss()
 
@@ -154,7 +165,8 @@ def train_one_seed(
         state = torch.load(last_path, map_location=device, weights_only=False)
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
-        scheduler.load_state_dict(state["scheduler"])
+        if scheduler is not None and state.get("scheduler") is not None:
+            scheduler.load_state_dict(state["scheduler"])
         start_epoch = state["epoch"] + 1
         best_r, best_epoch, history = state["best_r"], state["best_epoch"], state["history"]
         print(f"  resumed seed {seed} from epoch {start_epoch} (best r {best_r:+.3f})")
@@ -190,7 +202,8 @@ def train_one_seed(
             break
 
         val_scores, *_ = evaluate(model, loaders["val"], device)
-        scheduler.step(val_scores["pearson_r"])
+        if scheduler is not None:
+            scheduler.step(val_scores["pearson_r"])
         history.append({"epoch": epoch, "train_loss": train_loss, **val_scores})
 
         marker = ""
@@ -201,7 +214,7 @@ def train_one_seed(
             {
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
+                "scheduler": scheduler.state_dict() if scheduler is not None else None,
                 "epoch": epoch,
                 "best_r": best_r,
                 "best_epoch": best_epoch,
@@ -272,8 +285,8 @@ def main() -> int:
     parser.add_argument(
         "--lr-patience",
         type=int,
-        default=5,
-        help="ReduceLROnPlateau patience on val r",
+        default=10,
+        help="ReduceLROnPlateau patience on val r; 0 disables the scheduler",
     )
     parser.add_argument("--early-stop", type=int, default=15, help="0 disables")
     parser.add_argument("--num-workers", type=int, default=0)
@@ -330,13 +343,19 @@ def main() -> int:
         # able to memorise 16 examples; if it cannot, something is broken.
         subset = graphs["train"][: args.overfit]
         graphs = {"train": subset, "val": subset, "test": subset}
+        # One epoch here is a single optimizer step, so the epoch budget is a
+        # step budget: measured directly, this model needs ~600 steps at lr 1e-3
+        # to drive 16 complexes to zero loss. An earlier 120-epoch version of
+        # this test "failed" purely by running out of steps.
+        args.epochs = max(args.epochs, 800)
         args.early_stop = 0
+        args.lr_patience = 0  # no scheduler: this is a capacity test
         args.seeds = args.seeds[:1]
         args.dropout = 0.0
         args.log_every = max(args.log_every, 50)
         print(
-            f"\nOVERFIT SANITY MODE on {len(subset)} complexes: dropout off, "
-            f"{args.epochs} epochs.\n"
+            f"\nOVERFIT SANITY MODE on {len(subset)} complexes: dropout off, no "
+            f"LR schedule, {args.epochs} steps.\n"
             "Loss must approach zero and r approach 1.0. For reference, "
             "predicting the mean of this subset gives "
             f"MSE {float(np.var([float(g.y) for g in subset])):.2f} - a 'loss' "
