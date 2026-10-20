@@ -307,3 +307,244 @@ interaction model would need to prove itself. The interaction-aware baseline has
 All three are well calibrated (gap < 0.03), unlike the retrieval probe (gap 0.62). The ligand model's slope of 0.77 means it is mildly over-confident in its spread; the pocket models are very slightly under-confident.
 
 **Note for later.** Two ways of averaging seeds give slightly different numbers: the training scripts report the *mean of per-seed r* (pocket composition 0.475), the analysis script reports *r of the mean prediction* (0.477). Both are defensible, they are not errors, and the report should state which it uses. I am treating the training-script CSVs as canonical for headline scores and the analysis tables as canonical for diagnostics.
+
+---
+
+## 2026-10-12 — Graph Representation and Equivariant model implementation
+
+**Built:**
+
+- `src/lba/data/graph.py` — complex -> PyG graph. Hydrogens dropped (consistent with both baselines: they are ~52% of atoms and computationally added). 8 $\AA$ pocket trim around the ligand, 5 $\AA$ radius edges. Node scalars are element one-hot + is-ligand flag. No node vectors, since a lone atom has no intrinsic orientation. Edge scalars are 16 Gaussian RBFs over distance + 3 edge-type flags (pocket-pocket / ligand-ligand / pocket-ligand). Edge vectors are unit directions. Coordinates never enter as features. Whole splits cache to `.pt` keyed on a hash of the data root and both cutoffs.
+
+- `src/lba/models/gvp.py` — GVP-GNN, 571,271 parameters. Written from the papers
+  rather than ported from `drorlab/gvp-pytorch`, which targets torch 1.x. Three
+  message-passing rounds, hidden dims (100 scalar, 16 vector), vector gating,
+  equivariant LayerNorm (divide by RMS vector norm) and whole-channel vector
+  dropout. Mean aggregation, not sum, deliberately: node degree tracks pocket
+  size, which is the documented confound here, and sum would hand the model that
+  confound as a magnitude proportional to degree.
+
+Graph sizes: train 3507 (median 204 nodes / 3694 edges, max 492 nodes), val 466
+(187 / 3309), test 490 (196 / 3433).
+
+---
+
+## 2026-10-14 — Equivariance testing and fixing the graph-construction bug
+
+**Built:**
+- `scripts/test_equivariance.py` — the gate. Rotation, translation and permutation arms, in float32 and float64.
+
+- `scripts/train_gvp.py` — training, with per-epoch resumable checkpointing and an `--overfit N` sanity mode.
+
+- `scripts/analyze_gvp.py` — paired comparison against every baseline.
+
+
+**Equivariance passes exactly.** End-to-end float64, maximum absolute change in
+predicted pKd over 12 complexes:
+
+| Check | float32 | float64 |
+|---|---:|---:|
+| rotation | 2.98e-08 | 5.55e-17 |
+| translation | 2.98e-08 | 6.94e-17 |
+| permutation | 4.47e-08 | 8.33e-17 |
+
+Machine epsilon. Tested with untrained weights on purpose, invariance is a
+property of the architecture, not of the fit, and testing a checkpoint would
+conflate the two.
+
+**Bug** First run: float32 passed, float64 failed with rotation 7.9e-6 and permutation 2.5e-5. Permutation failing while rotation was comparatively clean pointed at indexing, not geometry.
+
+Cause: `torch_cluster.radius_graph` truncates to `max_num_neighbors` **by atom index order, not by distance**.
+So a cap that actually engages discards arbitrary close contacts, and *which* contacts it discards depends on the order atoms happen to appear in the deposited frame. I had set 32, a conventional default.
+Measured over 300 training complexes:
+
+| | |
+|---|---:|
+| uncapped max degree at 5 $\AA$ | 42 |
+| complexes with a node above a 32-cap | **77%** |
+| complexes with a node above a 48-cap | 0% |
+
+Set the cap to 48. Median edges rose 3412 -> 3694, about +9%. Nothing is
+truncated now, so the graph is a true radius graph and does not depend on atom
+ordering.
+
+This is the kind of bug that produces a plausible number from wrong data. No
+loss curve would have shown it. Note for the report: the roadmap only called for
+a rotation test; the permutation arm is what caught this. **If `edge_cutoff`
+ever goes above 5 $\AA$, the degree ceiling has to be re-measured.**
+
+---
+
+## 2026-10-15 - Debugging and validating training pipeline
+
+**Bug** The overfit sanity check plateaued at training loss 6.0 on 16 complexes and val r ~0.76. Predicting the mean of that subset gives MSE 6.09 — so it had learned essentially nothing, on data it was looking at directly. A 571k-parameter model must be able to memorise 16 examples.
+
+Diagnosed properly instead of guessing, with a throwaway script isolating
+optimisation from architecture:
+
+| Configuration | lr | final loss | r |
+|---|---:|---:|---:|
+| as-built, no scheduler, 600 steps | 1e-3 | 0.0000 | +1.000 |
+| as-built, no scheduler, 600 steps | 3e-3 | 0.0000 | +1.000 |
+| as-built, no scheduler, 600 steps | 1e-2 | 6.0949 | −0.082 |
+
+So the architecture was fine and the training loop was not. Two errors, both
+mine: `ReduceLROnPlateau(patience=5)` was firing on validation r, which in
+overfit mode is the training metric and is noisy and non-monotonic early, it
+had cut the LR to 6.25e-5 by epoch 32, before convergence was possible. And in
+overfit mode one epoch is one optimiser step, so `--epochs 120` gave 120 steps
+against the ~600 actually needed.
+
+Fixed: `--lr-patience 0` now disables the scheduler and the overfit test uses
+it; overfit budget raised to 800 steps; default patience raised 5 → 10 for real
+runs. That last change matters most — in a real run the same premature decay
+would have looked like a converged model rather than a strangled one, with no
+known-correct answer to compare against. After the fix: loss 52.4 → 0.0000,
+r = +1.000. **Lesson: a sanity check needs a stated pass threshold *and* a
+stated reference value, or a plateau at predict-the-mean looks like a loss.**
+
+Also learned: lr 1e-2 diverges outright. Usable band is 1e-3 to 3e-3.
+
+**One architectural measurement worth keeping.** At initialisation, pairwise
+cosine similarity between the pooled graph representations is **0.9943** (min
+0.9759) — per-node LayerNorm followed by mean-pooling really does squash the
+graphs together. Training overcomes it on 16 examples, so it is not fatal, but
+if the full runs train sluggishly this is the first suspect, and pooling before
+the final norm is the obvious thing to try.
+
+---
+
+## 2026-10-16 - First experiment and preliminary results
+
+**First real result - seed 0.** GTX 1650 Ti, 4.3 GB, batch 16, 45 s/epoch, no
+OOM. Early-stopped at epoch 33, best epoch 18 (val r +0.559). Test r = **+0.520**,
+RMSE 1.460. Local training is viable, Colab is insurance, not a blocker.
+
+**Paired bootstrap, seed 0 only — provisional.** 3000 resamples, 490 test
+complexes, joined on `pdb_id` with a `y_true` agreement check:
+
+| GVP vs | Δr (all, n=490) | 95% CI | Δr (novel, n=278) | 95% CI |
+|---|---:|---|---:|---|
+| ligand-only | +0.004 | [−0.047, +0.055] | +0.007 | [−0.062, +0.074] |
+| pocket, size-free | +0.043 | [−0.031, +0.114] | +0.004 | [−0.095, +0.106] |
+| pocket + size | −0.077 | [−0.150, −0.007] | −0.134 | [−0.237, −0.031] |
+| n_residues (one integer) | −0.056 | [−0.123, +0.008] | −0.112 | [−0.211, −0.011] |
+
+**Concluded (provisionally).**
+
+- Volkov replicated a third time, now with my own interaction-aware model: GVP
+  and ligand-only differ by +0.004 and cannot be separated. A model given the
+  full complex geometry does not beat one that never sees the protein.
+- GVP loses significantly to pocket+size, and on novel ligands it loses
+  significantly to `n_residues` — a linear fit on one integer. The novel stratum
+  is where interaction modelling should matter most, because it is where ligand
+  identity stops being available as a shortcut. That is the strongest version of
+  the benchmark critique I have.
+- "Not resolvable" is the finding, not a null to explain away. It is evidence
+  the benchmark does not distinguish these models.
+
+**Caveats, to deal with before any of this goes in the report.**
+
+1. **Seed 0 only.** Seeds 1 and 2 are still running. The seed-mean prediction is a
+   3-model ensemble and will probably score a little higher, which could move
+   the novel-stratum interval against `n_residues` (currently clearing zero by
+   only 0.011) to straddle zero. 
+2. **0.520 looks low.** Untuned, single configuration, 60-epoch budget, 8 $\AA$ trim, and the selected epoch was a noisy val peak (val r bounced 0.499–0.559, test came in below val). A reviewer will say the interaction model is undertrained. Jing et al. report RMSE only for LBA (1.594), which is beaten by a mode lthat never sees the protein, and by a linear fir on residue count.
+3. State the training budget plainly in Methodology.
+
+**TODO.**
+- Re-run `scripts/analyze_gvp.py` once seeds 1–2 land, and update the table above.
+- Start with the generation of negatives.
+
+---
+
+## 2026-10-20 - Three-seed evaluation and a correction of the conclusions
+
+**Supersedes the provisional paired table in the entry above.** That table was
+seed 0 only, and seed 0 turned out to be the worst of the three. Leaving it in
+place rather than editing it.
+
+**Three seeds.** 60-epoch budget, early-stop patience 15, same protocol for all
+three.
+
+| Seed | Best epoch | Val r | Test r |
+|---|---:|---:|---:|
+| 0 | 18 | +0.559 | +0.520 |
+| 1 | 44 | +0.660 | +0.614 |
+| 2 | 47 | +0.632 | +0.527 |
+
+Mean of per-seed r = **0.554** (sd 0.043). r of the seed-mean prediction =
+**0.596**. The gap between those two is 0.042 — far wider than the 0.475/0.477
+discrepancy noted for the pocket baselines on 2026-09-29, because averaging
+three neural nets is a real ensemble while averaging three 500-tree forests is
+nearly a no-op.
+
+**Seed 0 stopped prematurely.** It peaked at epoch 18 and stopped at 33; seeds 1
+and 2 peaked at 44 and 47. Val r moves +-0.03 between adjacent epochs, so
+patience 15 is small relative to the noise. Two of three seeds were still
+finding their best near the 60-epoch ceiling, so the budget is truncating them,
+not just seed 0.
+
+**Paired bootstrap on the seed-mean prediction** (3000 resamples, 490 complexes):
+
+| GVP vs | delta r (all) | 95% CI | delta r (novel, n=278) | 95% CI |
+|---|---:|---|---:|---|
+| ligand-only | +0.080 | [+0.033, +0.129] | +0.078 | [+0.013, +0.146] |
+| pocket, size-free | +0.119 | [+0.056, +0.179] | +0.075 | [−0.007, +0.159] |
+| pocket + size | −0.001 | [−0.064, +0.061] | −0.063 | [−0.151, +0.028] |
+| n_residues | +0.020 | [−0.043, +0.080] | −0.040 | [−0.127, +0.053] |
+
+Read alone, this says the interaction model significantly beats both blinded
+baselines — which would partly refute the premise of the project. It does not
+survive scrutiny.
+
+**The ensemble comparison is asymmetric, and that was the trap.** The GVP column
+is the mean of three networks; the baselines are random forests, already
+ensembles of 500 trees, so seed-averaging them changes almost nothing. Added
+per-seed paired bootstraps to `scripts/analyze_gvp.py` — one network against one
+forest, which is the like-for-like test:
+
+| GVP vs | seed 0 | seed 1 | seed 2 | seeds winning |
+|---|---:|---:|---:|---|
+| ligand-only | +0.004 tie | +0.098 win | +0.011 tie | 1/3 |
+| pocket, size-free | +0.043 tie | +0.138 win | +0.050 tie | 1/3 |
+| pocket + size | −0.077 LOSS | +0.018 tie | −0.070 LOSS | 0/3 |
+| n_residues | −0.056 tie | +0.038 tie | −0.049 tie | 0/3 |
+
+The ensemble win is ensembling plus one outlier seed. Seeds 0 and 2 differ from
+ligand-only by +0.004 and +0.011, which is nothing.
+
+**Concluded.**
+
+- **Volkov replicated, with my own interaction-aware model.** A single
+  E(3)-equivariant network over the full complex graph is statistically
+  indistinguishable from a 217-descriptor model that never sees the protein
+  (2 of 3 seeds tie; deltas +0.004 and +0.011).
+- **GVP never beats `n_residues`.** 0 of 3 seeds win, all three ties. An
+  equivariant interaction model, verified rotation-invariant to machine epsilon,
+  cannot be distinguished from a linear fit on the number of residues in the
+  pocket — a feature that exists only because ATOM3D cut each pocket around a
+  known ligand pose, and which could not be computed in the real prospective
+  task. This is the central result of the report.
+- **GVP loses to pocket+size in 2 of 3 seeds.** The confound beats the deep
+  model outright.
+- The ensemble result (+0.080 over ligand-only, significant) goes in the report
+  as a **sensitivity analysis, not a headline**, with the asymmetry stated: it
+  reflects ensembling against an already-ensembled baseline, and individual
+  networks do not reproduce it.
+
+**Methodological note for the report.** The headline direction depends on which
+seed-averaging convention is used: mean of per-seed r gives 0.554 (below
+`n_residues` at 0.576), r of the seed-mean gives 0.596 (above it). Per the
+2026-09-29 convention, the training-script CSVs are canonical, so 0.554 is the
+reported number. The report must state this explicitly rather than pick the
+favourable one; a reader who recomputes it the other way and finds the sign
+flipped will not be charitable. Both conventions agree qualitatively: a
+statistical tie with counting residues.
+
+**TODO.**
+- Re-run all three seeds at 120 epochs, patience 30. Two of three were still
+  improving at the ceiling and sd 0.043 is larger than several deltas I want to
+  report. 
+- Start with the generation of negatives.
+
