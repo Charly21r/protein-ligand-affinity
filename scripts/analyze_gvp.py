@@ -264,14 +264,40 @@ def main() -> int:
                 ),
             })
 
+    # Per-seed comparisons against each reference, not just the ensemble.
+    #
+    # This is not a nicety. The GVP column compared above is the mean of three
+    # networks' predictions, and averaging three neural nets gains a lot
+    # (r 0.554 -> 0.596 here). The baselines are random forests, already an
+    # ensemble of 500 trees, so seed-averaging them changes almost nothing. The
+    # ensemble comparison is therefore asymmetric in GVP's favour, and a "GVP
+    # wins" verdict there could be mostly an ensembling artefact. A single
+    # network against a single forest is the like-for-like test.
+    for column in seed_columns:
+        for reference in references:
+            rows.append({
+                "reference": reference,
+                "model": column,
+                "metric": "pearson_r",
+                "stratum": "all",
+                **paired_bootstrap_delta(
+                    y_true,
+                    merged[reference].to_numpy(),
+                    merged[column].to_numpy(),
+                    metric="pearson_r",
+                    n_boot=args.n_boot,
+                ),
+            })
+
     paired = pd.DataFrame(rows)
     write("paired", paired)
 
     # --------------------------------------------------------- the verdict
     print(f"\n{'=' * 78}\nGVP vs each reference, paired on the same complexes\n{'=' * 78}")
-    for stratum in paired["stratum"].unique():
-        subset = paired[
-            (paired["stratum"] == stratum) & (paired["metric"] == "pearson_r")
+    ensemble = paired[paired["model"] == GVP_COLUMN]
+    for stratum in ensemble["stratum"].unique():
+        subset = ensemble[
+            (ensemble["stratum"] == stratum) & (ensemble["metric"] == "pearson_r")
         ]
         n = int(novel.sum()) if stratum != "all" else len(merged)
         print(f"\n{stratum}  (n = {n})")
@@ -284,6 +310,25 @@ def main() -> int:
                 f"  vs {row.reference:<26} delta r = {row.delta:+.3f}  "
                 f"[{row.ci_low:+.3f}, {row.ci_high:+.3f}]   {verdict}"
             )
+
+    # Like-for-like: one network against one forest, per seed. If the ensemble
+    # wins above but individual seeds do not, the win is ensembling, not
+    # architecture, and the report has to say so.
+    print(f"\n{'=' * 78}\nSingle network vs single baseline, per seed (no ensembling)\n{'=' * 78}")
+    for reference in references:
+        verdicts = []
+        for column in seed_columns:
+            row = paired[
+                (paired["model"] == column)
+                & (paired["reference"] == reference)
+                & (paired["stratum"] == "all")
+            ].iloc[0]
+            mark = "win" if (row.significant and row.b_better) else (
+                "LOSS" if row.significant else "tie"
+            )
+            verdicts.append(f"{row.delta:+.3f} {mark}")
+        wins = sum(1 for v in verdicts if v.endswith("win"))
+        print(f"  vs {reference:<26} {' | '.join(verdicts)}   ({wins}/{len(seed_columns)} seeds win)")
 
     print(
         "\nRead 'not resolvable' as the finding it is: with these sample sizes the\n"
