@@ -548,3 +548,215 @@ statistical tie with counting residues.
   report. 
 - Start with the generation of negatives.
 
+---
+
+## 2026-10-21 — 120 epochs: the budget was not the problem
+
+**What I ran.** All three seeds at `--epochs 120 --early-stop 30`. Everything
+else identical to the previous entry: batch 16, lr 1e-3, lr-patience 10, 8 $\AA$
+pocket trim, 5 $\AA$ edge cutoff, same three seeds, same local GTX 1650 Ti. Only the
+budget and the early-stopping patience changed, so any difference is
+attributable to those two numbers (or to noise, which turns out to matter more
+than I expected).
+
+**The budget is no longer binding.** This was the whole point of the re-run.
+
+| Seed | Epochs run | Best epoch | Stopped because |
+|---|---:|---:|---|
+| 0 | 86 | 55 | patience 30 |
+| 1 | 75 | 44 | patience 30 |
+| 2 | 68 | 37 | patience 30 |
+
+All three early-stopped well short of the 120 ceiling, and no best epoch is anywhere near it. The truncation I diagnosed last time is gone. The models are not undertrained any more.
+
+**Results, against the 60-epoch run.**
+
+| | 60 epochs | 120 epochs |
+|---|---:|---:|
+| seed 0 | best 18 · val +0.559 · test **+0.520** · RMSE 1.460 | best 55 · val +0.604 · test **+0.532** · RMSE 1.501 |
+| seed 1 | best 44 · val +0.660 · test **+0.614** · RMSE 1.505 | best 44 · val +0.610 · test **+0.518** · RMSE 1.682 |
+| seed 2 | best 47 · val +0.632 · test **+0.527** · RMSE 1.567 | best 37 · val +0.598 · test **+0.494** · RMSE 1.594 |
+| mean of per-seed test r | **0.554** | **0.515** |
+| r of the seed-mean prediction | 0.596 | 0.550 |
+| mean test RMSE | 1.511 | 1.593 |
+
+**Doubling the budget made test performance slightly worse, not better.** Mean
+per-seed r fell from 0.554 to 0.515 while validation r rose for seed 0 and
+tightened across seeds (0.598-0.610, spread 0.012 against 0.101 before). More
+training bought a better-looking validation peak and a slightly worse test
+score. That is epoch selection chasing validation noise, not a model that needed
+more time.
+
+**What this settles.** Caveat 2 from the 2026-10-16 entry anticipated the
+obvious reviewer objection: 0.520 is at the low end of the published range, the
+model is undertrained, run it longer. After running it twice as long with a patience
+twice as forgiving, every seed converged and stopped on its own, and the number
+went *down*. That objection is now closed, and the central claim survives it:
+
+> An E(3)-equivariant model over the full complex graph, verified
+> rotation-invariant to machine epsilon and trained to convergence, scores
+> r = 0.515 on the ID30 test split: statistically indistinguishable from a
+> 217-descriptor model that never sees the protein (0.516) and from a linear
+> fit on pocket residue count (0.576), and significantly *worse* than both
+> the residue count and pocket+size on the novel-ligand stratum.
+
+**Paired bootstrap, 3000 resamples, 490 complexes, joined on `pdb_id`.** On the
+seed-mean prediction - the per-seed table below is the like-for-like one.
+
+| GVP vs | delta r (all, n=490) | 95% CI | delta r (novel, n=278) | 95% CI |
+|---|---:|---|---:|---|
+| ligand-only | +0.034 | [-0.018, +0.086] | -0.008 | [-0.083, +0.066] |
+| pocket, size-free | **+0.073** | [+0.007, +0.135] | -0.011 | [-0.101, +0.081] |
+| pocket + size | -0.047 | [-0.114, +0.020] | **-0.149** | [-0.243, -0.051] |
+| n_residues | -0.026 | [-0.094, +0.039] | **-0.126** | [-0.222, -0.024] |
+
+Per-seed, one network against one forest, no ensembling:
+
+| GVP vs | seed 0 | seed 1 | seed 2 | seeds winning |
+|---|---:|---:|---:|---|
+| ligand-only | +0.016 tie | +0.002 tie | -0.023 tie | 0/3 |
+| pocket, size-free | +0.056 tie | +0.042 tie | +0.017 tie | 0/3 |
+| pocket + size | -0.064 tie | -0.078 LOSS | -0.103 LOSS | 0/3 |
+| n_residues | -0.044 tie | -0.058 tie | -0.082 LOSS | 0/3 |
+
+**The 60-epoch ensemble win is gone.** At 60 epochs the seed-mean beat
+ligand-only by +0.080 [+0.033, +0.129], and I flagged it as a sensitivity
+analysis rather than a headline on the grounds that it was three networks
+averaged against an already-ensembled forest. At 120 epochs the same comparison
+is +0.034 [-0.018, +0.086] - not resolvable. The caveat was right and the effect
+did not reproduce. Nothing in the report rests on it.
+
+**The novel-ligand stratum is now a significant loss, and this is the result of
+the whole project so far.** At 60 epochs, seed-mean against `n_residues` on
+novel ligands was -0.040 [-0.127, +0.053], a tie. At 120 epochs it is **-0.126
+[-0.222, -0.024]** and the interval clears zero. Against pocket+size it is
+**-0.149 [-0.243, -0.051]**. On the stratum where ligand identity stops being
+available as a shortcut, and where interaction modelling ought therefore to
+matter most, the converged equivariant model is *significantly worse* than a
+linear fit on the number of residues in the pocket - a feature that exists only
+because ATOM3D cut each pocket around a known ligand pose, and which could not
+be computed in the real prospective task.
+
+**The one win, and why it rescues nothing.** GVP does beat the size-free pocket
+model overall, +0.073 [+0.007, +0.135], the only resolvable win anywhere in the
+table. But the same comparison on novel ligands is -0.011, a tie. The advantage
+exists only where ligand identity is available and evaporates where it is not.
+That is the shortcut thesis restated, not a counterexample to it.
+
+**My two scripts disagree on sd.** `analyze_gvp.py` prints 0.016 for the three
+seeds, `train_gvp.py` prints 0.020 for the same three numbers - ddof=0 against
+ddof=1, now inside my own pipeline rather than between my notes and my code.
+Fix one of them before the experiment matrix multiplies the problem by six
+configurations.
+
+*Resolved 2026-11-22:* `analyze_gvp.py` now uses `np.std(..., ddof=1)`, so every
+script in the pipeline reports the sample sd. Checked on the 120-epoch table:
+0.020 from both.
+
+**Retracting the Jing RMSE comparison.** I noted last week that Jing et al.
+report RMSE only (1.594) and that my model beat it. At 120 epochs my mean test
+RMSE is **1.593**. That is a dead heat, and with a spread of 0.090 across seeds
+the comparison was never stable enough to call either way. The honest wording
+for the report is "comparable to the published GVP-GNN", and the sentence that
+actually carries weight is the one that was always stronger: *every blinded
+baseline I have beats both of us on RMSE* - pocket+size 1.358, `n_residues`
+1.387, ligand-only 1.465.
+
+**Seed 1 has an R2 of 0.003.** Test RMSE 1.682 against 1.684 for predicting the
+test mean, while correlating at r = +0.518. It ranks complexes reasonably and is
+almost worthless in absolute terms - a pure calibration failure. Worth knowing
+because it means r and RMSE are not measuring the same thing for this model, and
+RMSE comparisons between runs are dominated by calibration drift rather than by
+anything about interactions. Lead with r in the report; give RMSE alongside and
+say why.
+
+**Training is not reproducible, and I can now prove it.** With a fixed seed and a
+strictly longer budget, the first 60 epochs should be identical and the best
+validation r can only go up. For seeds 1 and 2 it went **down** - 0.660 to 0.610
+and 0.632 to 0.598. The trajectories diverged. Two causes, and they separate
+cleanly:
+
+1. **A real bug in my resume path.** The checkpoint saves model, optimizer,
+   scheduler, epoch and history, but *not* the RNG state, so `torch.manual_seed`
+   restarts the shuffling and dropout sequence from the beginning on every
+   resume. Seed 1 was resumed twice (epochs 13 and 52) during the GPU trouble
+   below, so its trajectory is genuinely a different run after epoch 13.
+2. **Nondeterminism that is not a bug.** Seed 2 was never resumed - no
+   `resumed seed 2` line in the log - and diverged anyway. `torch_scatter` sums
+   messages with `atomicAdd`; float addition is not associative and atomics
+   complete in arbitrary order, so identical seeds drift apart over tens of
+   epochs. This is expected behaviour for GNN training on GPU and I had not
+   accounted for it.
+
+**Inference, by contrast, is exactly reproducible.** The 60-epoch CSVs were
+overwritten by this run before I had committed them. I rebuilt them from
+`results/checkpoints/gvp/seed*/best.pt` with the new
+`scripts/score_checkpoints.py`, and every number reproduced to three decimals
+seven days later - val, test, r, rho, RMSE, MAE, all three seeds, with each
+`best.pt` epoch matching the argmax of its `history.json`. So the graph cache,
+the element vocabulary and the forward pass are stable, and the nondeterminism
+lives in the backward pass. That is a precise enough statement to defend in the
+report.
+
+**Consequence for how I report this.** The 60-epoch and 120-epoch runs are *not*
+clean replicates of each other, so the 0.039 drop in mean r cannot be attributed
+to the budget alone - part of it is run-to-run noise of unmeasured size. The
+defensible claim is the one that holds under both budgets: **GVP sits at or
+below `n_residues` and level with ligand-only.**
+
+**An sd convention I had inconsistent.** I recorded sd 0.043 for the 60-epoch
+run, which is the population sd (numpy default, ddof=0). `train_gvp.py` prints
+the sample sd (pandas default, ddof=1), which for the same three numbers is
+0.053. Like for like: 60-epoch 0.053 / 0.043, 120-epoch 0.020 / 0.016. The
+tightening is real either way, but I need one convention stated once, the same
+way I pinned the seed-averaging convention on 2026-09-29. **Going with ddof=1**,
+because that is what the canonical training-script CSVs print.
+
+**Hardware episode, recorded because it will recur.** The run took 19 h instead
+of 3. The GPU was pinned at a 10 W enforced power limit against its 35 W
+default, P8, memory clock 405 MHz against 5001 MHz - a 12x drop that showed up
+as a 12x slowdown, 530 s/epoch against the 45 s/epoch I measured on 2026-10-16
+on the same card. Not thermal: 58 C with a 97 C slowdown threshold. `nvidia-smi`
+reported 99% utilisation throughout, which is a liveness signal and not a
+performance one. A reboot restored full clocks, then the cap returned after
+about 50 minutes, and a second reboot plus disabling the AC idle timeouts
+(`powercfg /change monitor-timeout-ac 0`, `standby-timeout-ac 0`) held for the
+rest of the run. **If a run is inexplicably slow, check `clocks.mem` and
+`nvidia-smi -q -d PERFORMANCE` before anything else.** Timings from this laptop
+are not trustworthy and should not appear in the report as benchmarks.
+
+**Concluded.**
+
+- **The interaction model is converged and still does not beat the blinded
+  baselines.** r = 0.515 (sd 0.020, ddof=1). 0 of 3 seeds win a single paired
+  comparison against any of the four references. The undertraining defence is
+  spent.
+- **Volkov replicated a fourth time, now at convergence.** GVP against
+  ligand-only is +0.034 [-0.018, +0.086] overall and -0.008 [-0.083, +0.066] on
+  novel ligands. A model given the full complex geometry cannot be separated
+  from one that never sees the protein.
+- **GVP is significantly worse than `n_residues` and than pocket+size on the
+  novel-ligand stratum** (-0.126 and -0.149, both intervals clearing zero).
+  This is the headline of the report: the stratum where interaction modelling
+  should matter most is the stratum where the interaction model loses outright
+  to counting residues.
+- **The conclusion is robust to the training budget**, which is a stronger claim
+  than either run makes alone, and the one to put in the report.
+- **The 60-epoch ensemble win did not reproduce.** My own caveat was correct;
+  the effect was ensembling, not modelling.
+- **The Jing RMSE comparison is a tie**, not a win. Retracted.
+- **My three-seed spread conflates seed variance with run-to-run
+  nondeterminism.** Until that is measured we need to be careful with the precision.
+
+**TODO.**
+
+- Save and restore RNG state (`torch.get_rng_state`, `np.random.get_state`) in
+  the checkpoint.
+- **Measure the nondeterminism**: run seed 0 twice, uninterrupted, same
+  everything, and compare test r. ~1.5 h, and it tells me how many decimal
+  places I am allowed to report.
+- Then negatives. The model work is done, the budget question is closed and the
+  benchmark critique now has a significant result behind it; everything after
+  this is Phase 3.
+
+
