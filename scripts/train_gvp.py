@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import random
 import sys
 import time
 
@@ -81,6 +82,41 @@ def make_model(args: argparse.Namespace, n_rbf: int) -> GVPAffinityModel:
         n_layers=args.n_layers,
         dropout=args.dropout,
     )
+
+
+def capture_rng_state() -> dict:
+    """Snapshot every RNG stream that training consumes.
+
+    Saved into ``last.pt`` so a resume continues the *same* random sequence
+    instead of restarting it. Without this, ``torch.manual_seed(seed)`` at the
+    top of ``train_one_seed`` rewinds shuffling and dropout to epoch 0 on every
+    resume, and a resumed seed silently becomes a different run - which is what
+    happened to seed 1 of the 120-epoch run (notebook, 2026-10-21).
+
+    The torch CPU generator matters most: with no explicit ``generator``, the
+    shuffling ``DataLoader`` draws each epoch's permutation seed from it. CUDA
+    generators drive dropout on GPU.
+    """
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def restore_rng_state(state: dict) -> None:
+    """Inverse of ``capture_rng_state``.
+
+    The tensors go through ``.cpu()`` because the checkpoint is loaded with
+    ``map_location=device``, which moves them to the GPU, and the setters only
+    accept CPU byte tensors.
+    """
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"].cpu())
+    if state.get("cuda") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda"]])
 
 
 @torch.no_grad()
@@ -122,6 +158,7 @@ def train_one_seed(
     """
     from torch_geometric.loader import DataLoader
 
+    random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -170,6 +207,13 @@ def train_one_seed(
         start_epoch = state["epoch"] + 1
         best_r, best_epoch, history = state["best_r"], state["best_epoch"], state["history"]
         print(f"  resumed seed {seed} from epoch {start_epoch} (best r {best_r:+.3f})")
+        if state.get("rng") is not None:
+            restore_rng_state(state["rng"])
+        else:
+            print(
+                "  WARNING: checkpoint predates RNG saving; shuffling and dropout "
+                "restart from the seed, so this resume is not a continuation"
+            )
         # A seed that already early-stopped must not train further on resume.
         # Without this, re-running all seeds after a killed session gives every
         # finished seed one extra epoch - and if that epoch happens to set a new
@@ -219,6 +263,10 @@ def train_one_seed(
                 "best_r": best_r,
                 "best_epoch": best_epoch,
                 "history": history,
+                # Captured after validation, which consumes no randomness
+                # (eval mode, unshuffled loaders), so this is exactly the state
+                # the next epoch's shuffle and dropout would start from.
+                "rng": capture_rng_state(),
             },
             last_path,
         )
