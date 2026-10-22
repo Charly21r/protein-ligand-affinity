@@ -200,7 +200,11 @@ def main() -> int:
         r_of_mean = pearson_ci(y_true, merged[GVP_COLUMN].to_numpy())["r"]
         print(
             f"  mean of per-seed r = {mean_of_r:+.3f} "
-            f"(sd {np.std(seed_scores):.3f}, n={len(seed_scores)});  "
+            # ddof=1 (sample sd), matching pandas .std() in train_gvp.py,
+            # score_checkpoints.py and the baseline scripts. np.std defaults to
+            # ddof=0 and printed 0.016 against train_gvp.py's 0.020 for the same
+            # three seeds (notebook, 2026-10-21).
+            f"(sd {np.std(seed_scores, ddof=1):.3f}, n={len(seed_scores)});  "
             f"r of the seed-mean prediction = {r_of_mean:+.3f}"
         )
         print("  (different quantities, per notebook.md - the report must say which it uses)")
