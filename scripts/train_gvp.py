@@ -61,7 +61,16 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "src"))
 from lba.data.graph import build_split_graphs, graph_dims  # noqa: E402
 from lba.data.lba import DEFAULT_CACHE, DEFAULT_RAW, SPLITS  # noqa: E402
 from lba.eval.metrics import format_metrics, regression_metrics  # noqa: E402
+from lba.data.families import (  # noqa: E402
+    DEFAULT_LABELS,
+    MASK,
+    family_targets,
+    load_family_labels,
+    n_families,
+)
+from lba.models.adversarial import FamilyDiscriminator  # noqa: E402
 from lba.models.gvp import GVPAffinityModel  # noqa: E402
+
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 OUT = PROJECT_ROOT / "results" / "tables"
@@ -119,6 +128,32 @@ def restore_rng_state(state: dict) -> None:
         torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda"]])
 
 
+def lambda_schedule(
+    epoch: int,
+    n_epochs: int,
+    max_lambda: float,
+    gamma: float = 10.0
+
+) -> float:
+    """ Ganin ramp: 0 at the start -> max_lambda by the end"""
+    p = epoch / n_epochs
+    return max_lambda * (2 / (1+np.exp(-gamma*p)) - 1)
+
+
+def first_selectable_epoch(n_epochs: int, gamma: float, min_frac: float) -> int:
+    """First epoch whose ramp value is >= min_frac of max λ (rule of 2026-11-23).
+
+    Depends only on the ramp's shape, not on λ_max, so the baseline gets the
+    same window as every adversarial run and the comparison stays like for like.
+    """
+    if min_frac <= 0:
+        return 0
+    for epoch in range(n_epochs):
+        if lambda_schedule(epoch, n_epochs, 1.0, gamma) >= min_frac:
+            return epoch
+    return n_epochs - 1
+
+
 @torch.no_grad()
 def evaluate(
     model: GVPAffinityModel, loader, device: torch.device
@@ -147,6 +182,8 @@ def train_one_seed(
     seed: int,
     device: torch.device,
     n_rbf: int,
+    run_name: str = "gvp",
+    labels: dict[str, int] | None = None,
 ) -> tuple[dict[str, dict[str, float]], pd.DataFrame]:
     """Train one seed to convergence and evaluate on val and test.
 
@@ -173,7 +210,22 @@ def train_one_seed(
     }
 
     model = make_model(args, n_rbf).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # Built *after* the model, so for a given seed the GVP starts from exactly
+    # the same weights as the baseline run. With --adv-lambda 0 it is not built
+    # at all: no extra RNG draws, so the baseline stays bit-for-bit reproducible.
+    discriminator = None
+    if args.adv_lambda > 0:
+        discriminator = FamilyDiscriminator(
+            in_dim=model.embedding_dim,
+            n_families=n_families(labels),
+            hidden=args.adv_hidden,
+            dropout=args.dropout,
+        ).to(device)
+        ce_fn = nn.CrossEntropyLoss(ignore_index=MASK)
+    trainable = list(model.parameters())
+    if discriminator is not None:
+        trainable += list(discriminator.parameters())
+    optimizer = torch.optim.Adam(trainable, lr=args.lr)
     # Plateau scheduling on the selection metric, so the schedule and the
     # selection criterion cannot disagree about what "better" means.
     #
@@ -197,10 +249,26 @@ def train_one_seed(
     last_path = checkpoint_dir / "last.pt"
     best_path = checkpoint_dir / "best.pt"
 
+    # Epochs before this cannot be selected and cannot trigger early stopping,
+    # otherwise best.pt can come from an epoch where λ was still ~0.
+    select_from = first_selectable_epoch(args.epochs, args.adv_gamma, args.select_min_frac)
+    print(f"  model selection restricted to epochs >= {select_from}")
+
     start_epoch, best_r, best_epoch, history = 0, -np.inf, -1, []
     if args.resume and last_path.exists():
         state = torch.load(last_path, map_location=device, weights_only=False)
+        # Resuming a baseline checkpoint as an adversarial run (or vice versa)
+        # would silently produce a hybrid that is neither. Checkpoints from
+        # before this key existed are baselines.
+        saved_lambda = state.get("adv_lambda", 0.0)
+        if saved_lambda != args.adv_lambda:
+            raise SystemExit(
+                f"{last_path} was trained with --adv-lambda {saved_lambda}, "
+                f"not {args.adv_lambda}; use a different --checkpoint-dir"
+            )
         model.load_state_dict(state["model"])
+        if discriminator is not None:
+            discriminator.load_state_dict(state["discriminator"])
         optimizer.load_state_dict(state["optimizer"])
         if scheduler is not None and state.get("scheduler") is not None:
             scheduler.load_state_dict(state["scheduler"])
@@ -218,24 +286,65 @@ def train_one_seed(
         # Without this, re-running all seeds after a killed session gives every
         # finished seed one extra epoch - and if that epoch happens to set a new
         # best val r, it silently changes which model gets selected.
-        if args.early_stop and state["epoch"] - best_epoch >= args.early_stop:
+        if args.early_stop and state["epoch"] - max(best_epoch, select_from) >= args.early_stop:
             print(f"  seed {seed} had already early-stopped at epoch {state['epoch']}, skipping training")
             start_epoch = args.epochs
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
-        started, total_loss, n_batches = time.time(), 0.0, 0
+        lambd = 0.0
+        if discriminator is not None:
+            discriminator.train()
+            lambd = lambda_schedule(epoch, args.epochs, args.adv_lambda, args.adv_gamma)
+        started = time.time()
+        total_loss = total_mse = total_ce = 0.0
+        n_batches = n_correct = n_labelled = 0
         for batch in loaders["train"]:
             batch = batch.to(device)
             optimizer.zero_grad()
-            loss = loss_fn(model(batch), batch.y.view(-1).to(model_dtype(model)))
+            pred, z = model(batch, return_z=True)
+            mse_loss = loss_fn(pred, batch.y.view(-1).to(model_dtype(model)))
+            loss = mse_loss
+            if discriminator is not None:
+                targets = family_targets(batch.pdb_id, labels, device)
+                labelled = targets != MASK
+                if labelled.any():
+                    # λ lives only inside the GRL: the discriminator gets the
+                    # plain CE gradient (learn to classify families), the encoder
+                    # gets it times -λ (learn to hide them). So the losses are
+                    # *added* - writing `mse - ce` as well would flip the sign
+                    # twice and make the encoder help the discriminator.
+                    family_logits = discriminator(z, lambd)
+                    ce_loss = ce_fn(family_logits, targets)
+                    n_correct += int(
+                        (family_logits.argmax(-1)[labelled] == targets[labelled]).sum()
+                    )
+                    n_labelled += int(labelled.sum())
+                else:
+                    # Every complex in the batch is outside the top-K families.
+                    # CE with mean reduction would be 0/0 = NaN here and trip the
+                    # non-finite abort, so contribute nothing instead.
+                    ce_loss = mse_loss.new_zeros(())
+                loss = mse_loss + ce_loss
+                total_ce += float(ce_loss.item())
             loss.backward()
             if args.grad_clip:
+                # Clipped separately: one joint norm would let a large
+                # discriminator gradient shrink the encoder's update, or the
+                # other way round.
                 nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                if discriminator is not None:
+                    nn.utils.clip_grad_norm_(discriminator.parameters(), args.grad_clip)
             optimizer.step()
             total_loss += float(loss.item())
+            total_mse += float(mse_loss.item())
             n_batches += 1
         train_loss = total_loss / max(n_batches, 1)
+        train_mse = total_mse / max(n_batches, 1)
+        train_ce = total_ce / max(n_batches, 1)
+        # Read against the majority-family rate, not against 0: a discriminator
+        # that always guesses the biggest family already scores that.
+        disc_acc = n_correct / n_labelled if n_labelled else float("nan")
 
         if not np.isfinite(train_loss):
             # Node vectors start at exactly zero, where the gradient of a plain
@@ -248,15 +357,29 @@ def train_one_seed(
         val_scores, *_ = evaluate(model, loaders["val"], device)
         if scheduler is not None:
             scheduler.step(val_scores["pearson_r"])
-        history.append({"epoch": epoch, "train_loss": train_loss, **val_scores})
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "train_mse": train_mse,
+                "train_ce": train_ce,
+                "disc_acc": disc_acc,
+                "lambda": lambd,
+                **val_scores,
+            }
+        )
 
         marker = ""
-        if val_scores["pearson_r"] > best_r:
+        if epoch >= select_from and val_scores["pearson_r"] > best_r:
             best_r, best_epoch, marker = val_scores["pearson_r"], epoch, "  *"
             torch.save({"model": model.state_dict(), "epoch": epoch}, best_path)
         torch.save(
             {
                 "model": model.state_dict(),
+                "discriminator": (
+                    discriminator.state_dict() if discriminator is not None else None
+                ),
+                "adv_lambda": args.adv_lambda,
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict() if scheduler is not None else None,
                 "epoch": epoch,
@@ -272,14 +395,19 @@ def train_one_seed(
         )
 
         if epoch % args.log_every == 0 or epoch == args.epochs - 1:
+            adv = (
+                f"mse {train_mse:.4f}  ce {train_ce:.3f}  acc {disc_acc:.2f}  λ {lambd:.3f}  "
+                if discriminator is not None
+                else ""
+            )
             print(
-                f"  epoch {epoch:>4}  loss {train_loss:.4f}  "
+                f"  epoch {epoch:>4}  loss {train_loss:.4f}  {adv}"
                 f"val r {val_scores['pearson_r']:+.3f}  val rmse {val_scores['rmse']:.3f}  "
                 f"lr {optimizer.param_groups[0]['lr']:.2e}  "
                 f"{time.time() - started:.0f}s{marker}"
             )
 
-        if args.early_stop and epoch - best_epoch >= args.early_stop:
+        if args.early_stop and epoch - max(best_epoch, select_from) >= args.early_stop:
             print(f"  no val improvement in {args.early_stop} epochs, stopping")
             break
 
@@ -300,7 +428,7 @@ def train_one_seed(
         scores[split], predictions, truths, ids = evaluate(model, loaders[split], device)
         if split == "test":
             predictions_frame = pd.DataFrame(
-                {"pdb_id": ids, "y_true": truths, f"gvp_seed{seed}": predictions}
+                {"pdb_id": ids, "y_true": truths, f"{run_name}_seed{seed}": predictions}
             )
     return scores, predictions_frame
 
@@ -318,9 +446,21 @@ def main() -> int:
     parser.add_argument(
         "--checkpoint-dir",
         type=pathlib.Path,
-        default=PROJECT_ROOT / "results" / "checkpoints" / "gvp",
-        help="on Colab, point this at Drive - /content is wiped when the session dies",
+        default=None,
+        help=(
+            "default results/checkpoints/<run name>. On Colab, point this at "
+            "Drive - /content is wiped when the session dies"
+        ),
     )
+    parser.add_argument(
+        "--adv-lambda",
+        type=float,
+        default=0.0,
+        help="max gradient-reversal strength for the family adversary; 0 = baseline, no adversary",
+    )
+    parser.add_argument("--adv-gamma", type=float, default=10.0, help="steepness of the λ ramp")
+    parser.add_argument("--adv-hidden", type=int, default=128, help="discriminator hidden width")
+    parser.add_argument("--family-labels", type=pathlib.Path, default=DEFAULT_LABELS)
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -337,6 +477,15 @@ def main() -> int:
         help="ReduceLROnPlateau patience on val r; 0 disables the scheduler",
     )
     parser.add_argument("--early-stop", type=int, default=15, help="0 disables")
+    parser.add_argument(
+        "--select-min-frac",
+        type=float,
+        default=0.9,
+        help=(
+            "only epochs where the λ ramp is >= this fraction of max λ can be "
+            "selected or trigger early stopping; applies to the baseline too. 0 disables"
+        ),
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=1, help="epochs between log lines")
     parser.add_argument("--pocket-cutoff", type=float, default=8.0)
@@ -356,6 +505,29 @@ def main() -> int:
     )
     args = parser.parse_args()
     device = torch.device(args.device)
+
+    # Everything the run writes is keyed on this, so an adversarial run can
+    # never overwrite (or resume from) the baseline's checkpoints and tables.
+    run_name = "gvp" if args.adv_lambda == 0 else f"gvp_adv{args.adv_lambda:g}"
+    if args.checkpoint_dir is None:
+        args.checkpoint_dir = PROJECT_ROOT / "results" / "checkpoints" / run_name
+
+    labels = None
+    if args.adv_lambda > 0:
+        # Loaded before the graphs so a bad path fails in seconds, not minutes.
+        label_path = args.family_labels
+        if not label_path.is_absolute():
+            label_path = PROJECT_ROOT / label_path
+        labels = load_family_labels(label_path)
+        family_ids = pd.Series([f for f in labels.values() if f != MASK])
+        print(
+            f"  majority-family accuracy (discriminator floor): "
+            f"{family_ids.value_counts(normalize=True).iloc[0]:.3f}"
+        )
+        print(
+            f"adversary: {n_families(labels)} families, max λ {args.adv_lambda:g}, "
+            f"γ {args.adv_gamma:g}, labels {label_path.relative_to(PROJECT_ROOT)}"
+        )
 
     print(f"device: {device}")
     if device.type == "cuda":
@@ -397,6 +569,7 @@ def main() -> int:
         # this test "failed" purely by running out of steps.
         args.epochs = max(args.epochs, 800)
         args.early_stop = 0
+        args.select_min_frac = 0.0
         args.lr_patience = 0  # no scheduler: this is a capacity test
         args.seeds = args.seeds[:1]
         args.dropout = 0.0
@@ -413,11 +586,13 @@ def main() -> int:
     all_rows, prediction_frames = [], []
     for seed in args.seeds:
         print(f"\n{'=' * 72}\nseed {seed}\n{'=' * 72}")
-        scores, predictions = train_one_seed(args, graphs, seed, device, args.n_rbf)
+        scores, predictions = train_one_seed(
+            args, graphs, seed, device, args.n_rbf, run_name=run_name, labels=labels
+        )
         for split, split_scores in scores.items():
             all_rows.append(
                 {
-                    "model": "gvp",
+                    "model": run_name,
                     "features": "complex",
                     "seed": seed,
                     "split": split,
@@ -440,7 +615,11 @@ def main() -> int:
 
     frame = pd.DataFrame(all_rows)
     OUT.mkdir(parents=True, exist_ok=True)
-    metrics_path = OUT / f"gvp_baseline_id{args.identity}.csv"
+    metrics_path = OUT / (
+        f"gvp_baseline_id{args.identity}.csv"
+        if run_name == "gvp"
+        else f"{run_name}_id{args.identity}.csv"
+    )
     frame.to_csv(metrics_path, index=False)
 
     # Per-complex predictions, one column per seed plus the seed-mean. Joinable
@@ -451,19 +630,19 @@ def main() -> int:
     merged = prediction_frames[0]
     for extra in prediction_frames[1:]:
         merged = merged.merge(extra.drop(columns=["y_true"]), on="pdb_id", how="inner")
-    seed_columns = [c for c in merged.columns if c.startswith("gvp_seed")]
-    merged["gvp_complex"] = merged[seed_columns].mean(axis=1)
-    predictions_path = OUT / f"gvp_predictions_id{args.identity}.csv"
+    seed_columns = [c for c in merged.columns if c.startswith(f"{run_name}_seed")]
+    merged[f"{run_name}_complex"] = merged[seed_columns].mean(axis=1)
+    predictions_path = OUT / f"{run_name}_predictions_id{args.identity}.csv"
     merged.to_csv(predictions_path, index=False)
 
     print(f"\n{'=' * 72}\nTEST SPLIT (mean over {len(args.seeds)} seeds)\n{'=' * 72}")
     test = frame[frame["split"] == "test"]
     summary = test[["pearson_r", "spearman_r", "rmse", "mae"]].mean()
-    print(format_metrics("gvp [complex]", summary.to_dict()))
+    print(format_metrics(f"{run_name} [complex]", summary.to_dict()))
     print(f"  r sd over seeds: {test['pearson_r'].std():.3f}")
 
     mean_prediction_r = float(
-        np.corrcoef(merged["y_true"], merged["gvp_complex"])[0, 1]
+        np.corrcoef(merged["y_true"], merged[f"{run_name}_complex"])[0, 1]
     )
     print(f"  r of the seed-mean prediction: {mean_prediction_r:+.3f}")
 

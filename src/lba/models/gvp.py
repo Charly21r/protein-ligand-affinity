@@ -356,9 +356,18 @@ class GVPAffinityModel(nn.Module):
             nn.Linear(width, 1),
         )
 
-    def forward(self, batch) -> torch.Tensor:
+    @property
+    def embedding_dim(self) -> int:
+        """Width of the pooled graph embedding ``z`` returned by ``forward``."""
+        return self.head[0].in_features
+
+    def forward(
+        self, batch, return_z: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """:param batch: a PyG ``Batch`` of graphs from ``lba.data.graph``.
-        :returns: ``(n_graphs,)`` predicted pK_d.
+        :param return_z: also return the pooled embedding, for the adversary.
+        :returns: ``(n_graphs,)`` predicted pK_d, or ``(pred, z)`` with ``z`` of
+            shape ``(n_graphs, embedding_dim)`` when ``return_z``.
         """
         # batch.x is a bare scalar tensor: node vector channels are zero on input.
         s, v = self.node_embedding(batch.x)
@@ -380,4 +389,8 @@ class GVPAffinityModel(nn.Module):
                 s[mask], graph_index[mask], dim=0, dim_size=n_graphs
             )
             pooled = torch.cat([pooled, ligand_pooled], dim=-1)
-        return self.head(pooled).squeeze(-1)
+
+        pred = self.head(pooled).squeeze(-1)
+        if return_z:
+            return pred, pooled
+        return pred
