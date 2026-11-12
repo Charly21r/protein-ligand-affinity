@@ -8,7 +8,9 @@ __pycache__/
 # Data — never commit. See README for how to fetch.
 data/raw/
 data/processed/
-data/splits/
+data/splits/*
+# Family labels need MMseqs2 to rebuild, so they are tracked; Colab reads them from the clone.
+!data/splits/train_families.csv
 *.lmdb
 *.mdb
 *.tar.gz
