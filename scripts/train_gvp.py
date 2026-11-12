@@ -141,7 +141,7 @@ def lambda_schedule(
 
 
 def first_selectable_epoch(n_epochs: int, gamma: float, min_frac: float) -> int:
-    """First epoch whose ramp value is >= min_frac of max λ (rule of 2026-11-23).
+    """First epoch whose ramp value is >= min_frac of max λ.
 
     Depends only on the ramp's shape, not on λ_max, so the baseline gets the
     same window as every adversarial run and the comparison stays like for like.
@@ -526,7 +526,7 @@ def main() -> int:
         )
         print(
             f"adversary: {n_families(labels)} families, max λ {args.adv_lambda:g}, "
-            f"γ {args.adv_gamma:g}, labels {label_path.relative_to(PROJECT_ROOT)}"
+            f"γ {args.adv_gamma:g}, labels {label_path}"
         )
 
     print(f"device: {device}")
@@ -569,7 +569,6 @@ def main() -> int:
         # this test "failed" purely by running out of steps.
         args.epochs = max(args.epochs, 800)
         args.early_stop = 0
-        args.select_min_frac = 0.0
         args.lr_patience = 0  # no scheduler: this is a capacity test
         args.seeds = args.seeds[:1]
         args.dropout = 0.0
