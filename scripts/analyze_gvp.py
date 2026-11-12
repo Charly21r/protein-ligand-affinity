@@ -68,9 +68,12 @@ OUT = PROJECT_ROOT / "results" / "tables"
 # notebook's standing caveat applies - the mean of per-seed r and the r of the
 # mean prediction are different quantities, and both are reported below.
 GVP_COLUMN = "gvp_complex"
+BASELINE_RUN = "gvp"
 
 
-def load_tables(identity: int) -> tuple[pd.DataFrame, list[str], list[str]]:
+def load_tables(
+    identity: int, run_name: str = BASELINE_RUN
+) -> tuple[pd.DataFrame, list[str], list[str], str]:
     """Join baseline and GVP test predictions on ``pdb_id``.
 
     Both tables are per-complex predictions on the same 490-complex test split,
@@ -80,7 +83,8 @@ def load_tables(identity: int) -> tuple[pd.DataFrame, list[str], list[str]]:
     this does that verification in code.
     """
     baseline_path = OUT / "analysis_predictions.csv"
-    gvp_path = OUT / f"gvp_predictions_id{identity}.csv"
+    gvp_path = OUT / f"{run_name}_predictions_id{identity}.csv"
+    model_column = f"{run_name}_complex"
     for path, script in (
         (baseline_path, "scripts/analyze_baselines.py"),
         (gvp_path, "scripts/train_gvp.py"),
@@ -95,12 +99,23 @@ def load_tables(identity: int) -> tuple[pd.DataFrame, list[str], list[str]]:
         c for c in baselines.columns
         if c not in ("pdb_id", "y_true", "max_tanimoto_to_train")
     ]
-    seed_columns = sorted(c for c in gvp.columns if c.startswith("gvp_seed"))
-    if GVP_COLUMN not in gvp.columns:
-        raise SystemExit(f"{gvp_path.name} has no {GVP_COLUMN!r} column")
+    seed_columns = sorted(c for c in gvp.columns if c.startswith(f"{run_name}_seed"))
+    if model_column not in gvp.columns:
+        raise SystemExit(f"{gvp_path.name} has no {model_column!r} column")
+
+    # An adversarial run is compared against the baseline GVP as well: that is
+    # the comparison the adversary exists for. Ensemble vs ensemble only, so the
+    # comparison stays symmetric (both are seed-means of three networks).
+    if run_name != BASELINE_RUN:
+        baseline_gvp_path = OUT / f"{BASELINE_RUN}_predictions_id{identity}.csv"
+        if not baseline_gvp_path.exists():
+            raise SystemExit(f"missing {baseline_gvp_path.relative_to(PROJECT_ROOT)}")
+        baseline_gvp = pd.read_csv(baseline_gvp_path)[["pdb_id", GVP_COLUMN]]
+        baselines = baselines.merge(baseline_gvp, on="pdb_id", how="inner")
+        baseline_models.append(GVP_COLUMN)
 
     merged = baselines.merge(
-        gvp[["pdb_id", "y_true", *seed_columns, GVP_COLUMN]],
+        gvp[["pdb_id", "y_true", *seed_columns, model_column]],
         on="pdb_id",
         how="inner",
         suffixes=("", "_gvp"),
@@ -130,7 +145,7 @@ def load_tables(identity: int) -> tuple[pd.DataFrame, list[str], list[str]]:
             "regenerate both before trusting any comparison."
         )
     merged = merged.drop(columns=["y_true_gvp"])
-    return merged, baseline_models, seed_columns
+    return merged, baseline_models, seed_columns, model_column
 
 
 def add_n_residues_baseline(merged: pd.DataFrame, identity: int) -> str:
@@ -164,17 +179,28 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--identity", type=int, default=30, choices=[30, 60])
     parser.add_argument("--n-boot", type=int, default=3000)
+    parser.add_argument(
+        "--run-name",
+        default=BASELINE_RUN,
+        help=(
+            "prefix of the prediction table written by train_gvp.py, e.g. "
+            "'gvp_adv0.3' reads gvp_adv0.3_predictions_id30.csv and writes "
+            "analysis_gvp_adv0.3_*.csv. Default 'gvp' is the baseline."
+        ),
+    )
     args = parser.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     written = []
 
     def write(name: str, frame: pd.DataFrame) -> None:
-        path = OUT / f"analysis_gvp_{name}.csv"
+        path = OUT / f"analysis_{args.run_name}_{name}.csv"
         frame.to_csv(path, index=False)
         written.append(path.name)
 
     print("Loading prediction tables ...")
-    merged, baseline_models, seed_columns = load_tables(args.identity)
+    merged, baseline_models, seed_columns, model_column = load_tables(
+        args.identity, args.run_name
+    )
     print(f"  {len(merged)} test complexes in common, "
           f"{len(baseline_models)} baselines, {len(seed_columns)} GVP seeds")
 
@@ -184,7 +210,7 @@ def main() -> int:
     y_true = merged["y_true"].to_numpy()
     similarity = merged["max_tanimoto_to_train"].to_numpy()
     references = [*baseline_models, n_residues_column]
-    all_models = [*references, GVP_COLUMN]
+    all_models = [*references, model_column]
 
     # ------------------------------------------------- per-seed spread first
     # Before any comparison: how much does the GVP number move with the seed?
@@ -197,7 +223,7 @@ def main() -> int:
         print(f"  {column:<14} r = {scores['r']:+.3f}  [{scores['ci_low']:+.3f}, {scores['ci_high']:+.3f}]")
     if seed_scores:
         mean_of_r = float(np.mean(seed_scores))
-        r_of_mean = pearson_ci(y_true, merged[GVP_COLUMN].to_numpy())["r"]
+        r_of_mean = pearson_ci(y_true, merged[model_column].to_numpy())["r"]
         print(
             f"  mean of per-seed r = {mean_of_r:+.3f} "
             # ddof=1 (sample sd), matching pandas .std() in train_gvp.py,
@@ -235,13 +261,13 @@ def main() -> int:
         for metric in ("pearson_r", "rmse"):
             rows.append({
                 "reference": reference,
-                "model": GVP_COLUMN,
+                "model": model_column,
                 "metric": metric,
                 "stratum": "all",
                 **paired_bootstrap_delta(
                     y_true,
                     merged[reference].to_numpy(),
-                    merged[GVP_COLUMN].to_numpy(),
+                    merged[model_column].to_numpy(),
                     metric=metric,
                     n_boot=args.n_boot,
                 ),
@@ -256,13 +282,13 @@ def main() -> int:
         for reference in references:
             rows.append({
                 "reference": reference,
-                "model": GVP_COLUMN,
+                "model": model_column,
                 "metric": "pearson_r",
                 "stratum": "novel_ligands_sim_lt_0.4",
                 **paired_bootstrap_delta(
                     y_true[novel],
                     merged[reference].to_numpy()[novel],
-                    merged[GVP_COLUMN].to_numpy()[novel],
+                    merged[model_column].to_numpy()[novel],
                     metric="pearson_r",
                     n_boot=args.n_boot,
                 ),
@@ -277,8 +303,9 @@ def main() -> int:
     # ensemble comparison is therefore asymmetric in GVP's favour, and a "GVP
     # wins" verdict there could be mostly an ensembling artefact. A single
     # network against a single forest is the like-for-like test.
+    per_seed_references = [r for r in references if r != GVP_COLUMN or args.run_name == BASELINE_RUN]
     for column in seed_columns:
-        for reference in references:
+        for reference in per_seed_references:
             rows.append({
                 "reference": reference,
                 "model": column,
@@ -298,7 +325,7 @@ def main() -> int:
 
     # --------------------------------------------------------- the verdict
     print(f"\n{'=' * 78}\nGVP vs each reference, paired on the same complexes\n{'=' * 78}")
-    ensemble = paired[paired["model"] == GVP_COLUMN]
+    ensemble = paired[paired["model"] == model_column]
     for stratum in ensemble["stratum"].unique():
         subset = ensemble[
             (ensemble["stratum"] == stratum) & (ensemble["metric"] == "pearson_r")
@@ -319,7 +346,7 @@ def main() -> int:
     # wins above but individual seeds do not, the win is ensembling, not
     # architecture, and the report has to say so.
     print(f"\n{'=' * 78}\nSingle network vs single baseline, per seed (no ensembling)\n{'=' * 78}")
-    for reference in references:
+    for reference in per_seed_references:
         verdicts = []
         for column in seed_columns:
             row = paired[
